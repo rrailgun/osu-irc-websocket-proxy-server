@@ -3,6 +3,36 @@ const expressWs = require('express-ws');
 const IRC = require('irc-framework');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+require('dotenv').config();
+const OSU_CLIENT_ID = process.env.OSU_CLIENT_ID;
+const OSU_CLIENT_SECRET = process.env.OSU_CLIENT_SECRET;
+let bearerToken = null;
+let tokenExpiresAt = 0;
+
+async function refreshToken() {
+  let params = new URLSearchParams();
+  params.append('client_id', OSU_CLIENT_ID);
+  params.append('client_secret', OSU_CLIENT_SECRET);
+  params.append('grant_type', 'client_credentials');
+  params.append('scope', 'public');
+
+  let res = await fetch('https://osu.ppy.sh/oauth/token', {
+    method: 'POST',
+    body: params,
+  });
+
+  let json = await res.json();
+  bearerToken = json.access_token;
+  // Set expiry time a bit earlier than actual expiry for safety (in ms)
+  tokenExpiresAt = Date.now() + (json.expires_in - 60) * 1000;
+}
+
+async function getValidToken() {
+  if (!bearerToken || Date.now() >= tokenExpiresAt) {
+    await refreshToken();
+  }
+  return bearerToken;
+}
 
 const app = express();
 expressWs(app); // Attach WebSocket support to Express
@@ -92,6 +122,19 @@ app.ws('/', (ws, req) => {
             ircClient.quit('WebSocket closed');
         }
     });
+});
+
+app.get('/api/match/:matchId', async (req, res) => {
+    let token = await getValidToken();
+    fetch(`https://osu.ppy.sh/api/v2/matches/${req.params.matchId}`, {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'osu-api-express/1.0',
+        }
+    })
+        .then(response => response.json())
+        .then(data => res.json(data));
 });
 
 // Start the server
