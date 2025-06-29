@@ -3,27 +3,36 @@ const expressWs = require('express-ws');
 const IRC = require('irc-framework');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-require('dotenv').config();
+const dotenv = require('dotenv');
+const path = require('path');
+
+const requiredEnvVars = ['OSU_CLIENT_ID', 'OSU_CLIENT_SECRET'];
+const missingVars = requiredEnvVars.filter((key) => !process.env[key]);
+
+if (missingVars.length > 0) {
+  const localEnvPath = path.join(__dirname, '.env');
+  dotenv.config({ path: localEnvPath });
+}
 const OSU_CLIENT_ID = process.env.OSU_CLIENT_ID;
 const OSU_CLIENT_SECRET = process.env.OSU_CLIENT_SECRET;
+
 let bearerToken = null;
 let tokenExpiresAt = 0;
 
 async function refreshToken() {
-  let params = new URLSearchParams();
+  const params = new URLSearchParams();
   params.append('client_id', OSU_CLIENT_ID);
   params.append('client_secret', OSU_CLIENT_SECRET);
   params.append('grant_type', 'client_credentials');
   params.append('scope', 'public');
 
-  let res = await fetch('https://osu.ppy.sh/oauth/token', {
+  const res = await fetch('https://osu.ppy.sh/oauth/token', {
     method: 'POST',
     body: params,
   });
 
-  let json = await res.json();
+  const json = await res.json();
   bearerToken = json.access_token;
-  // Set expiry time a bit earlier than actual expiry for safety (in ms)
   tokenExpiresAt = Date.now() + (json.expires_in - 60) * 1000;
 }
 
@@ -35,7 +44,7 @@ async function getValidToken() {
 }
 
 const app = express();
-const wsInstance = expressWs(app); // Attach WebSocket support to Express
+const wsInstance = expressWs(app);
 const apiRouter = express.Router();
 wsInstance.applyTo(apiRouter);
 
@@ -45,111 +54,123 @@ app.use(cors());
 app.use(bodyParser.json());
 
 apiRouter.get('/', (req, res) => {
-    res.send('IRC Proxy running with express-ws');
+  res.send('IRC Proxy running with express-ws');
 });
 
-// WebSocket route for IRC proxy
 apiRouter.ws('/', (ws, req) => {
-    let ircClient = null;
+  let ircClient = null;
 
-    ws.on('message', (msg) => {
-        try {
-            const data = JSON.parse(msg);
+  ws.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg);
 
-            if (data.type === 'connect') {
-                const { username, password } = data;
+      if (data.type === 'connect') {
+        const { username, password } = data;
+        ircClient = new IRC.Client();
 
-                ircClient = new IRC.Client();
+        ircClient.on('error', (error) => {
+          console.log(`[IRC] Error:`, error);
+          ws.send(JSON.stringify({ type: 'error', error: error.message || error }));
+        });
 
-                ircClient.on('error', (error) => {
-                    console.log(`[IRC] Error:`, error);
-                    ws.send(JSON.stringify({ type: 'error', error: error.message || error }));
-                });
+        ircClient.on('close', (e) => {
+          connectedUsers.splice(connectedUsers.indexOf(username), 1);
+          ws.send(JSON.stringify({ type: 'close', event: e }));
+        });
 
-                ircClient.on('close', (e) => {
-                    connectedUsers.splice(connectedUsers.indexOf(username), 1);
-                    ws.send(JSON.stringify({ type: 'close', event: e }));
-                });
+        ircClient.connect({
+          host: 'irc.ppy.sh',
+          port: 6667,
+          ssl: false,
+          nick: username,
+          username,
+          password
+        });
 
-                ircClient.connect({
-                    host: 'irc.ppy.sh',
-                    port: 6667,
-                    ssl: false,
-                    nick: username,
-                    username,
-                    password
-                });
+        ircClient.on('registered', () => {
+          console.log(`[IRC] Connected as ${username}`);
+          connectedUsers.push(username);
+          ws.send(JSON.stringify({ type: 'connected' }));
+        });
 
-                ircClient.on('registered', () => {
-                    console.log(`[IRC] Connected as ${username}`);
-                    connectedUsers.push(username);
-                    ws.send(JSON.stringify({ type: 'connected' }));
-                });
+        ircClient.on('message', (event) => {
+          ws.send(JSON.stringify(event));
+        });
 
-                ircClient.on('message', (event) => {
-                    ws.send(JSON.stringify(event));
-                });
+        ircClient.on('join', (event) => {
+          ws.send(JSON.stringify({
+            type: 'join',
+            channel: event.channel,
+            nick: event.nick
+          }));
+        });
+      }
 
-                ircClient.on('join', (event) => {
-                    ws.send(JSON.stringify({
-                        type: 'join',
-                        channel: event.channel,
-                        nick: event.nick
-                    }));
-                });
-            }
-
-            if (ircClient) {
-                switch (data.type) {
-                    case 'join':
-                        ircClient.join(data.channel);
-                        break;
-                    case 'message':
-                        ircClient.say(data.target, data.message);
-                        break;
-                    case 'part':
-                        ircClient.part(data.target, '');
-                        break;
-                    case 'quit':
-                        ircClient.quit(data.message || 'Client quit');
-                        break;
-                }
-            }
-        } catch (err) {
-            console.error('[WS] Failed to parse message:', err);
-            ws.send(JSON.stringify({ type: 'error', error: 'Invalid message format' }));
+      if (ircClient) {
+        switch (data.type) {
+          case 'join':
+            ircClient.join(data.channel);
+            break;
+          case 'message':
+            ircClient.say(data.target, data.message);
+            break;
+          case 'part':
+            ircClient.part(data.target, '');
+            break;
+          case 'quit':
+            ircClient.quit(data.message || 'Client quit');
+            break;
         }
-    });
+      }
+    } catch (err) {
+      console.error('[WS] Failed to parse message:', err);
+      ws.send(JSON.stringify({ type: 'error', error: 'Invalid message format' }));
+    }
+  });
 
-    ws.on('close', () => {
-        console.log('[WS] WebSocket closed');
-        if (ircClient) {
-            ircClient.quit('WebSocket closed');
-        }
-    });
+  ws.on('close', () => {
+    console.log('[WS] WebSocket closed');
+    if (ircClient) {
+      ircClient.quit('WebSocket closed');
+    }
+  });
 });
 
 apiRouter.get('/api/match/:matchId', async (req, res) => {
-    let token = await getValidToken();
-    fetch(`https://osu.ppy.sh/api/v2/matches/${req.params.matchId}`, {
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'osu-api-express/1.0',
-        }
-    })
-        .then(response => response.json())
-        .then(data => res.json(data));
+  let token = await getValidToken();
+  fetch(`https://osu.ppy.sh/api/v2/matches/${req.params.matchId}`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'osu-api-express/1.0',
+    }
+  })
+    .then(response => response.json())
+    .then(data => res.json(data));
 });
 
-apiRouter.get('/api/connected-users', (req,res) => {
-    res.send(connectedUsers);
+apiRouter.get('/api/connected-users', (req, res) => {
+  res.send(connectedUsers);
 })
 
-app.use('/chat', apiRouter)
+app.use('/chat', apiRouter);
 
-// Start the server
-const PORT = 3000;
-app.listen(PORT, () => {
-    console.log(`IRC proxy server listening on http://localhost:${PORT}`);
-});
+function startAPIServer(port = 3000) {
+  return new Promise((resolve, reject) => {
+    const server = app
+      .listen(port, () => {
+        console.log(`IRC proxy server listening on http://localhost:${port}`);
+        resolve(server);
+      })
+      .on('error', reject);
+  });
+}
+
+if (require.main === module) {
+  startAPIServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { startAPIServer };
