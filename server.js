@@ -35,17 +35,21 @@ async function getValidToken() {
 }
 
 const app = express();
-expressWs(app); // Attach WebSocket support to Express
+const wsInstance = expressWs(app); // Attach WebSocket support to Express
+const apiRouter = express.Router();
+wsInstance.applyTo(apiRouter);
+
+const connectedUsers = [];
 
 app.use(cors());
 app.use(bodyParser.json());
 
-app.get('/', (req, res) => {
+apiRouter.get('/', (req, res) => {
     res.send('IRC Proxy running with express-ws');
 });
 
 // WebSocket route for IRC proxy
-app.ws('/', (ws, req) => {
+apiRouter.ws('/', (ws, req) => {
     let ircClient = null;
 
     ws.on('message', (msg) => {
@@ -63,7 +67,7 @@ app.ws('/', (ws, req) => {
                 });
 
                 ircClient.on('close', (e) => {
-                    console.log(e);
+                    connectedUsers.splice(connectedUsers.indexOf(username), 1);
                     ws.send(JSON.stringify({ type: 'close', event: e }));
                 });
 
@@ -78,6 +82,7 @@ app.ws('/', (ws, req) => {
 
                 ircClient.on('registered', () => {
                     console.log(`[IRC] Connected as ${username}`);
+                    connectedUsers.push(username);
                     ws.send(JSON.stringify({ type: 'connected' }));
                 });
 
@@ -124,7 +129,7 @@ app.ws('/', (ws, req) => {
     });
 });
 
-app.get('/api/match/:matchId', async (req, res) => {
+apiRouter.get('/api/match/:matchId', async (req, res) => {
     let token = await getValidToken();
     fetch(`https://osu.ppy.sh/api/v2/matches/${req.params.matchId}`, {
         headers: {
@@ -136,6 +141,12 @@ app.get('/api/match/:matchId', async (req, res) => {
         .then(response => response.json())
         .then(data => res.json(data));
 });
+
+apiRouter.get('/api/connected-users', (req,res) => {
+    res.send(connectedUsers);
+})
+
+app.use('/chat', apiRouter)
 
 // Start the server
 const PORT = 3000;
